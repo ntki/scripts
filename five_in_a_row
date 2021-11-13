@@ -1,0 +1,231 @@
+#!/bin/bash
+
+# TCP/IP Five-in-a-row game written in bash with netcat and tput.
+
+# Usage: five_in_a_row [remote_address]
+# Run without a remote address it runs in server mode, listening on TCP:8000.
+# Controls: h,j,k,l to navigate. Space to mark a field. i for chat mode.
+
+REMOTE_ADDR="$1"
+PORT=8000
+MESSAGE_LINE_WIDTH=30
+
+BLUE='\e[1;34m'
+RED='\e[1;31m'
+PURPLE='\e[1;35m'
+OFF='\e[0m'
+CURSOR='\e[43m'
+M_OWN="${RED}><${OFF}"
+M_OPP="${BLUE}()${OFF}"
+M_EMPTY="..${OFF}"
+M_OWNWIN="${PURPLE}XX${OFF}"
+M_OPPWIN="${PURPLE}OO${OFF}"
+
+S_OWNTURN="Your turn!"
+S_OPPTURN="Opponent's turn!"
+S_LOSE="You have lost!"
+S_WIN="You have won!"
+S_LISTENING="Waiting for connection..."
+S_CONNECTING="Connecting..."
+S_CONNECTION_LOST="Connection lost."
+
+EVENT_LOOP=/tmp/.event_loop.$$
+TO_SOCK=/tmp/.to_sock.$$
+mkfifo $TO_SOCK $EVENT_LOOP
+exec 6<>$EVENT_LOOP 8<>$TO_SOCK
+rm -- $EVENT_LOOP $TO_SOCK
+
+send_event()  { echo "$@" >&6; }
+send_socket() { echo "$@" >&8; }
+
+init_field() {
+  FIELD=()
+  for ((i = 15 * 15; i > 0; i--)); do
+    FIELD=("${FIELD[@]}" "${M_EMPTY}")
+  done
+}
+
+get_field() {  # column=$1 row=$2
+  echo "${FIELD[$(($2 % 15 * 15 + $1 % 15))]}"
+}
+
+set_field() {  # column=$1 row=$2 mark=$3
+  FIELD[$(($2 % 15 * 15 + $1 % 15))]="$3"
+}
+
+put() {  # column=$1 row=$2 mark=$3
+  local x=$(($1 % 15))
+  local y=$(($2 % 15))
+  if [[ $(get_field $x $y) != "${M_EMPTY}" ]]; then
+    return 32
+  fi
+  set_field $x $y "$3"
+  if search_winner $x $y "$3"; then
+    [[ $3 == "${M_OWN}" ]] && STATUS="${S_WIN}" || STATUS="${S_LOSE}"
+    send_event "GAME_OVER"
+  else
+    [[ $3 == "${M_OWN}" ]] && STATUS="${S_OPPTURN}" || STATUS="${S_OWNTURN}"
+  fi
+  return 0
+}
+
+search_winner() {  # column=$1 row=$2 mark=$3
+  local dirx=(1 0 1 1)
+  local diry=(0 1 1 -1)
+
+  for a in {0..3}; do  # checks all four directions
+    local x=$1
+    local y=$2
+    local dx=${dirx[$a]}
+    local dy=${diry[$a]}
+    while (( 0 <= x && x < 15 && 0 <= y && y < 15 )) && [[ "$(get_field $x $y)" == "$3" ]]; do
+      (( x += dx, y += dy ))
+    done
+    (( x -= dx, y -= dy ))
+    local endx=$x  # possible winning line's end
+    local endy=$y
+    local counter=0
+    while (( 0 <= x && x < 15 && 0 <= y && y < 15 )) && [[ "$(get_field $x $y)" == "$3" ]]; do
+      (( x -= dx, y -= dy, counter++ ))
+    done
+    if (( counter >= 5 )); then  # we have a winner
+      (( x += dx, y += dy ))
+      local SIGN="${M_OPPWIN}"
+      [[ "$3" == "${M_OWN}" ]] && SIGN="${M_OWNWIN}"
+      for ((c = 0; c < counter; c++)); do  # highlight the winning marks
+        set_field $((endx - dx * c)) $((endy - dy * c)) "${SIGN}"
+      done
+      return 0
+    fi
+  done
+  return 1
+}
+
+paint_field() {
+  local CURFIELD=("${FIELD[@]}")
+  local CURPOZ=$((CUR_Y * 15 + CUR_X))
+  CURFIELD[${CURPOZ}]="${CURSOR}${FIELD[${CURPOZ}]}"
+
+  tput cup 0 0
+  for i in {0..14}; do
+    echo -e "${CURFIELD[@]:$((i*15)):15}\r"
+  done
+}
+
+display_messages() {
+  local i=0
+  for line in "${MSGBUF[@]}"; do
+    tput cup $(( i++ )) 50
+    echo -ne "${line}"
+  done
+
+  tput cup 15 0
+  echo -ne "${STATUS}\r\n${INPUT_MODE}${INPUT}"
+}
+
+message() {
+  local TEXT="$1"
+  while [[ -n "$TEXT" ]]; do
+    MSGBUF=("${MSGBUF[@]}" "${TEXT:0:$MESSAGE_LINE_WIDTH}")
+    TEXT="${TEXT:$MESSAGE_LINE_WIDTH}"
+  done
+  local CUT=$(( ${#MSGBUF[@]} - 15 ))
+  (( CUT < 0 )) && CUT=0
+  MSGBUF=("${MSGBUF[@]:$CUT}")
+}
+
+trap "kill 0; stty sane; echo" EXIT
+
+( # DISPATCHER
+  STATUS=""
+  FIELD=()
+  MSGBUF=()
+  CUR_X=7
+  CUR_Y=7
+  INPUT=""
+  INPUT_MODE="[SELECT]"
+  init_field
+  while IFS="" read -r -u 6 EVENT; do  # IFS="" to keep Space
+    case "${EVENT}" in
+      SOCKET:HELO)   STATUS="${S_OPPTURN}" ;;
+      SOCKET:REEE)   STATUS="${S_OWNTURN}" ;;
+      SOCKET:put\ *) put ${EVENT#SOCKET:put } "${M_OPP}" ;;
+      SOCKET:say\ *) message "OPP: ${EVENT#SOCKET:say }" ;;
+      CONNECTION_LOST_EVENT)
+        STATUS="${S_CONNECTION_LOST}"
+        display_messages
+        ;&
+      GAME_OVER) kill $$ ;;
+      STATUS:*)  STATUS="${EVENT#STATUS:}" ;;
+      NAV-UP)    (( CUR_Y += 14, CUR_Y %= 15 )) ;;
+      NAV-DOWN)  (( CUR_Y++,     CUR_Y %= 15 )) ;;
+      NAV-LEFT)  (( CUR_X += 14, CUR_X %= 15 )) ;;
+      NAV-RIGHT) (( CUR_X++,     CUR_X %= 15 )) ;;
+      USER-PUT)
+        if [[ ${S_OWNTURN} == "${STATUS}" ]]; then
+          if put ${CUR_X} ${CUR_Y} "${M_OWN}"; then
+            send_socket "put ${CUR_X} ${CUR_Y}"
+          fi
+        fi
+        ;;
+      INSERT-MODE) INPUT_MODE="[INSERT]: " ;;
+      INPUT-ENTER)
+        if [[ ${INPUT_MODE} == "[INSERT]: " ]] && [[ -n "${INPUT}" ]]; then
+          send_socket "say ${INPUT}"
+          message "YOU: ${INPUT}"
+        fi
+        INPUT=""
+        INPUT_MODE="[SELECT]"
+        ;;
+      INPUT-BACKSPACE) INPUT="${INPUT%?}" ;;
+      INPUT:*)         INPUT+="${EVENT#INPUT:}" ;;
+    esac
+    clear
+    paint_field
+    display_messages
+  done ) &
+
+
+if [[ -n ${REMOTE_ADDR} ]]; then
+  NCCMD="nc ${REMOTE_ADDR} ${PORT}"
+  send_event "STATUS:${S_CONNECTING}"
+  FIRST_MESSAGE="HELO"
+else
+  NCCMD="nc -l -p ${PORT}"
+  send_event "STATUS:${S_LISTENING}"
+  FIRST_MESSAGE="REEE"
+fi
+
+# CONNECTER
+( <&8 ${NCCMD} | sed -u 's/^/SOCKET:/g' >&6
+  send_event "CONNECTION_LOST_EVENT"; ) &
+( while :; do send_socket "KEEP-ALIVE"; sleep 1; done ) &
+
+send_socket "${FIRST_MESSAGE}"
+
+stty raw -echo
+
+MODE="select"
+while :; do
+  CHARZ=$(dd if=/dev/tty bs=24 count=1 2>/dev/null | od -An -tx1)
+  for HEX in ${CHARZ}; do
+    if [[ ${MODE} == "select" ]]; then
+      case ${HEX} in
+        "69") MODE="insert"; send_event "INSERT-MODE" ;;  # i
+        "68") send_event "NAV-LEFT" ;;   # h
+        "6a") send_event "NAV-DOWN" ;;   # j
+        "6b") send_event "NAV-UP" ;;     # k
+        "6c") send_event "NAV-RIGHT" ;;  # l
+        "20") send_event "USER-PUT" ;;   # space
+        "71") ;&                         # q
+        "03") break 2 ;;                 # ^C
+      esac
+    else
+      case ${HEX} in
+        "0d") MODE="select"; send_event "INPUT-ENTER" ;;
+        "7f") send_event "INPUT-BACKSPACE" ;;
+        *)    send_event "INPUT:$(echo -en '\x'"${HEX}")" ;;
+      esac
+    fi
+  done
+done

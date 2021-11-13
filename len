@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# Lists and sums the playlengths and bitrates of media files.
+# Based on awk and mediainfo.
+
+# Usage: len [-s] [paths]
+# -s: Disables the running sum. Default if the output is not a tty.
+
+
+SUM_OPT=1
+if [[ "$1" == "-s" ]]; then
+  SUM_OPT=0
+  shift
+fi
+[[ -t 1 ]] || SUM_OPT=0  # disable if stdout is not a terminal
+[[ $# -eq 0 ]] && set .
+
+printf "%s\0" "$@" \
+  | xargs -0 -L1 -P$(nproc) \
+    mediainfo --Inform="General;%Duration%	%Duration/String3%	%OverallBitRate%	%CompleteName%\n" \
+  | awk -F '\t' -v ORS='' '
+    function format_time(secs) {
+      return sprintf("%.2d:%.2d:%.2d", secs / 3600, secs % 3600 / 60, secs % 60);
+    }
+    {
+      if ($3 < 3000) next;  # ignore .IFO, .BUP, etc
+      printf("%.8s  %5d  %s\n", $2, $3 / 1000, $4);
+      if ('$SUM_OPT') {
+        SUM += $1;
+        print format_time(SUM / 1000) "\r";
+        fflush();
+      }
+    } END {
+      if ('$SUM_OPT') print format_time(SUM / 1000) "\n";
+    }'

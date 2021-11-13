@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Executed multiple times within timeout it shifts the cmd that will be executed.
+# If the last cmd is reached before timeout then it is executed immediatelly.
+# Useful for hotkey handlers like sxhkd that does not support different functionality for multiple hotkey presses.
+# Inspired by Vim.
+
+# Usage: multi_click timeout cmd1 [cmd2 [, cmd3...]]
+
+DELAY=${1:?Missing timeout argument.}
+ID=$(printf "%s\0" "$@" | md5sum | cut -f1 -d' ')
+COUNTER="/tmp/multi_click_${ID}_counter"
+shift
+: ${1:?Missing command arguments.}
+
+if mkfifo "${COUNTER}" 2>/dev/null; then
+  # read -t/-N is buggy in bash <=4.3
+  # <> opens in rw so it does not hang
+  read -N $(( $# - 1 )) -t ${DELAY} <>"${COUNTER}"
+  rm -- "${COUNTER}"
+  shift ${#REPLY}
+  echo -- "${1}"
+  bash -c "${1}"
+else
+  echo 1<>"${COUNTER}"
+fi
